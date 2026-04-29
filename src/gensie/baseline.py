@@ -4,6 +4,10 @@ from typing import Any, Dict
 from openai import OpenAI
 from gensie.agent import GenSIEAgent, Participant, ParticipantInfo, PipelineInfo
 from gensie.task import Task
+from gensie.pipelines import (
+    EnhancedPromptAgent, CoTExtractAgent, SelfCorrectAgent,
+    FewShotAgent, CoTFewShotAgent, EnsembleAgent,
+)
 from dotenv import load_dotenv
 from logging import getLogger
 
@@ -70,11 +74,14 @@ class OfficialParticipant(Participant):
     """
 
     def __init__(self):
-        # Default pipeline using the reference BasicAgent
         self.pipelines = {
             "baseline": BasicAgent(),
-            # "pipeline2": MyCustomAgent(arg1, arg2...),
-            # "pipeline3": AnotherAgent(...),
+            "enhanced-prompt": EnhancedPromptAgent(),
+            "cot-extract": CoTExtractAgent(),
+            "self-correct": SelfCorrectAgent(),
+            "few-shot": FewShotAgent(),
+            "cot-few-shot": CoTFewShotAgent(),
+            "ensemble": EnsembleAgent(),
         }
 
     def get_info(self) -> ParticipantInfo:
@@ -86,8 +93,30 @@ class OfficialParticipant(Participant):
                     name="baseline",
                     description="Standard OpenAI agent using structured outputs.",
                 ),
-                # Add descriptions for your other pipelines here:
-                # PipelineInfo(name="pipeline2", description="My advanced RAG agent"),
+                PipelineInfo(
+                    name="enhanced-prompt",
+                    description="Schema-aware prompt engineering with null-trap detection.",
+                ),
+                PipelineInfo(
+                    name="cot-extract",
+                    description="Two-step Chain-of-Thought reasoning then constrained extraction.",
+                ),
+                PipelineInfo(
+                    name="self-correct",
+                    description="Extract-validate-correct loop with null-trap verification.",
+                ),
+                PipelineInfo(
+                    name="few-shot",
+                    description="RAG pipeline with schema-similar examples as demonstrations.",
+                ),
+                PipelineInfo(
+                    name="cot-few-shot",
+                    description="Hybrid: few-shot examples guide CoT reasoning then extraction.",
+                ),
+                PipelineInfo(
+                    name="ensemble",
+                    description="Dual extraction (strict+creative) with smart field-level merge.",
+                ),
             ],
         )
 
