@@ -4,7 +4,7 @@ from typing import Any, Dict
 from openai import OpenAI
 from gensie.agent import GenSIEAgent, Participant, ParticipantInfo, PipelineInfo
 from gensie.task import Task
-from gensie.pipelines import EnhancedPromptAgent, CoTExtractAgent
+from gensie.pipelines import EnhancedPromptAgent, CoTExtractAgent, SelfCorrectAgent, FewShotAgent
 from dotenv import load_dotenv
 from logging import getLogger
 
@@ -75,6 +75,8 @@ class OfficialParticipant(Participant):
             "baseline": BasicAgent(),
             "enhanced-prompt": EnhancedPromptAgent(),
             "cot-extract": CoTExtractAgent(),
+            "self-correct": SelfCorrectAgent(),
+            "few-shot": FewShotAgent(),
         }
 
     def get_info(self) -> ParticipantInfo:
@@ -93,6 +95,14 @@ class OfficialParticipant(Participant):
                 PipelineInfo(
                     name="cot-extract",
                     description="Two-step Chain-of-Thought reasoning then constrained extraction.",
+                ),
+                PipelineInfo(
+                    name="self-correct",
+                    description="Extract-validate-correct loop with null-trap verification.",
+                ),
+                PipelineInfo(
+                    name="few-shot",
+                    description="RAG pipeline with schema-similar examples as demonstrations.",
                 ),
             ],
         )
