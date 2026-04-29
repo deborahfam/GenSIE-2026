@@ -665,3 +665,298 @@ class FewShotAgent(GenSIEAgent):
         except Exception as e:
             logger.error(f"FewShotAgent error: {e}")
             return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 5: CoT + Few-Shot (hybrid)
+# ---------------------------------------------------------------------------
+
+class CoTFewShotAgent(GenSIEAgent):
+    """
+    Hybrid pipeline combining Chain-of-Thought with Few-Shot examples:
+    1. Find similar examples from dev set (reuses FewShotAgent logic).
+    2. Reasoning step: model analyzes text+schema with examples as reference,
+       producing a field-by-field analysis.
+    3. Extraction step: uses reasoning + examples for constrained extraction.
+    """
+
+    def __init__(self, data_dirs: Optional[List[str]] = None):
+        self.client = get_client()
+        # Reuse FewShotAgent's example store
+        self._few_shot = FewShotAgent(data_dirs=data_dirs)
+
+    def run(self, task: Task, model: str) -> Dict[str, Any]:
+        analysis = analyze_schema(task.target_schema)
+        similar = self._few_shot._find_similar(task, max_examples=1)  # 1 example to save tokens
+
+        # --- Step 1: Reasoning with example context ---
+        reasoning_parts = [
+            "Analiza el texto y el esquema campo por campo.",
+            "Para cada campo indica el valor a extraer o si debe ser null.",
+            "Sé breve: 1-2 líneas por campo.",
+        ]
+
+        if similar:
+            reasoning_parts.append("\nEJEMPLO DE REFERENCIA:")
+            ex = similar[0]
+            text_preview = ex.get("input_text", "")[:300] + "..."
+            reasoning_parts.append(f"Texto: {text_preview}")
+            reasoning_parts.append(
+                f"Resultado: {json.dumps(ex.get('output', {}), indent=2, ensure_ascii=False)}"
+            )
+            reasoning_parts.append(
+                "Observa cómo se manejan los null y los enums en el ejemplo anterior.\n"
+            )
+
+        if analysis["null_traps"]:
+            reasoning_parts.append("CAMPOS NULLABLE (null si no está en el texto):")
+            for trap in analysis["null_traps"]:
+                reasoning_parts.append(f'  - "{trap["field"]}": {trap["description"]}')
+
+        if analysis["enum_fields"]:
+            reasoning_parts.append("\nCAMPOS ENUM:")
+            for ef in analysis["enum_fields"]:
+                values_str = ", ".join(f'"{v}"' for v in ef["values"])
+                reasoning_parts.append(f'  - "{ef["field"]}": [{values_str}]')
+
+        reasoning_parts.extend([
+            f"\nINSTRUCCIÓN: {task.instruction}",
+            f"\nESQUEMA:\n{json.dumps(task.target_schema, indent=2, ensure_ascii=False)}",
+            f"\nTEXTO:\n{task.input_text}",
+        ])
+
+        try:
+            reasoning_response = self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Eres un analista de textos experto. Examina el texto y determina "
+                            "qué información puede extraerse según el esquema. "
+                            "Usa el ejemplo de referencia como guía de estilo."
+                        ),
+                    },
+                    {"role": "user", "content": "\n".join(reasoning_parts)},
+                ],
+                temperature=0.0,
+                max_tokens=1200,
+            )
+            reasoning = reasoning_response.choices[0].message.content or ""
+        except Exception as e:
+            logger.warning(f"CoTFewShotAgent reasoning failed: {e}")
+            reasoning = ""
+
+        # --- Step 2: Extraction with reasoning context ---
+        extract_parts = []
+        if reasoning:
+            extract_parts.append(f"ANÁLISIS PREVIO:\n{reasoning}\n")
+
+        if similar:
+            ex = similar[0]
+            extract_parts.append("EJEMPLO DE REFERENCIA:")
+            extract_parts.append(
+                f"Resultado: {json.dumps(ex.get('output', {}), indent=2, ensure_ascii=False)}\n"
+            )
+
+        extract_parts.extend([
+            f"INSTRUCCIÓN: {task.instruction}",
+            f"\nESQUEMA:\n{json.dumps(task.target_schema, indent=2, ensure_ascii=False)}",
+            f"\nTEXTO:\n{task.input_text}",
+            "\nGenera el JSON. Usa null para datos ausentes del texto.",
+        ])
+
+        try:
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Eres un agente de extracción preciso. Extrae SOLO información "
+                            "presente en el texto. Devuelve null para datos ausentes."
+                        ),
+                    },
+                    {"role": "user", "content": "\n".join(extract_parts)},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "extraction",
+                        "schema": task.target_schema,
+                        "strict": True,
+                    },
+                },
+                temperature=0.0,
+            )
+            content = response.choices[0].message.content
+            return json.loads(content)
+        except Exception as e:
+            logger.error(f"CoTFewShotAgent extraction error: {e}")
+            return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 6: Ensemble (dual extraction + merge)
+# ---------------------------------------------------------------------------
+
+class EnsembleAgent(GenSIEAgent):
+    """
+    Runs two extractions with different prompt strategies and merges results:
+    - Run A: Enhanced prompt (grounding-focused, strict null instructions)
+    - Run B: Extraction-focused (shorter prompt, slightly creative temp)
+
+    Merge logic per field:
+    - Both agree → use shared value
+    - One null, one not → prefer null for null-trap fields, non-null otherwise
+    - Both non-null but different → prefer Run A (stricter prompt)
+    - Lists → prefer longer list (more complete extraction)
+    """
+
+    def __init__(self):
+        self.client = get_client()
+
+    def _run_strict(self, task: Task, model: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Run A: strict grounding-focused extraction."""
+        system = (
+            "Eres un agente de extracción EXTREMADAMENTE conservador.\n"
+            "SOLO extrae lo que está LITERALMENTE en el texto.\n"
+            "Ante la menor duda, devuelve null.\n"
+            "Es mejor devolver null que inventar un dato."
+        )
+
+        user_parts = [f"INSTRUCCIÓN: {task.instruction}", ""]
+
+        if analysis["null_traps"]:
+            user_parts.append("CAMPOS NULLABLE — devuelve null si NO está en el texto:")
+            for trap in analysis["null_traps"]:
+                user_parts.append(f'  - {trap["field"]}: {trap["description"]}')
+            user_parts.append("")
+
+        user_parts.extend([
+            f"ESQUEMA:\n{json.dumps(task.target_schema, indent=2, ensure_ascii=False)}",
+            "",
+            f"TEXTO:\n{task.input_text}",
+        ])
+
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": "\n".join(user_parts)},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "extraction",
+                    "schema": task.target_schema,
+                    "strict": True,
+                },
+            },
+            temperature=0.0,
+        )
+        return json.loads(response.choices[0].message.content)
+
+    def _run_creative(self, task: Task, model: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Run B: more thorough extraction with slight temperature."""
+        system = (
+            "Eres un agente de extracción de datos completo y preciso.\n"
+            "Extrae toda la información relevante del texto según el esquema.\n"
+            "Para campos enum, razona sobre el contenido para elegir el valor correcto.\n"
+            "Devuelve null solo cuando la información claramente no está en el texto."
+        )
+
+        if analysis["enum_fields"]:
+            system += "\n\nCAMPOS ENUM:"
+            for ef in analysis["enum_fields"]:
+                values_str = ", ".join(f'"{v}"' for v in ef["values"])
+                system += f'\n  - "{ef["field"]}": [{values_str}] — {ef["description"]}'
+
+        user_parts = [
+            f"INSTRUCCIÓN: {task.instruction}",
+            "",
+            f"ESQUEMA:\n{json.dumps(task.target_schema, indent=2, ensure_ascii=False)}",
+            "",
+            f"TEXTO:\n{task.input_text}",
+        ]
+
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": "\n".join(user_parts)},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "extraction",
+                    "schema": task.target_schema,
+                    "strict": True,
+                },
+            },
+            temperature=0.3,
+        )
+        return json.loads(response.choices[0].message.content)
+
+    def _merge(self, result_a: Dict[str, Any], result_b: Dict[str, Any],
+               analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Merges two extraction results field by field."""
+        null_trap_names = {t["field"] for t in analysis["null_traps"]}
+        merged = {}
+
+        all_keys = set(result_a.keys()) | set(result_b.keys())
+
+        for key in all_keys:
+            val_a = result_a.get(key)
+            val_b = result_b.get(key)
+
+            # Both agree
+            if val_a == val_b:
+                merged[key] = val_a
+                continue
+
+            # One null, one not
+            if val_a is None and val_b is not None:
+                # For null-trap fields, prefer null (conservative/strict)
+                merged[key] = None if key in null_trap_names else val_b
+                continue
+
+            if val_b is None and val_a is not None:
+                merged[key] = None if key in null_trap_names else val_a
+                continue
+
+            # Both non-null but different
+            if isinstance(val_a, list) and isinstance(val_b, list):
+                # Prefer longer list (more complete)
+                merged[key] = val_a if len(val_a) >= len(val_b) else val_b
+            else:
+                # Prefer strict run (Run A) for non-list values
+                merged[key] = val_a
+
+        return merged
+
+    def run(self, task: Task, model: str) -> Dict[str, Any]:
+        analysis = analyze_schema(task.target_schema)
+
+        # Run both extractions
+        try:
+            result_a = self._run_strict(task, model, analysis)
+        except Exception as e:
+            logger.error(f"EnsembleAgent strict run failed: {e}")
+            result_a = None
+
+        try:
+            result_b = self._run_creative(task, model, analysis)
+        except Exception as e:
+            logger.error(f"EnsembleAgent creative run failed: {e}")
+            result_b = None
+
+        # Fallback logic
+        if result_a is None and result_b is None:
+            return {"error": "Both ensemble runs failed"}
+        if result_a is None:
+            return result_b
+        if result_b is None:
+            return result_a
+
+        return self._merge(result_a, result_b, analysis)

@@ -4,7 +4,10 @@ from typing import Any, Dict
 from openai import OpenAI
 from gensie.agent import GenSIEAgent, Participant, ParticipantInfo, PipelineInfo
 from gensie.task import Task
-from gensie.pipelines import EnhancedPromptAgent, CoTExtractAgent, SelfCorrectAgent, FewShotAgent
+from gensie.pipelines import (
+    EnhancedPromptAgent, CoTExtractAgent, SelfCorrectAgent,
+    FewShotAgent, CoTFewShotAgent, EnsembleAgent,
+)
 from dotenv import load_dotenv
 from logging import getLogger
 
@@ -77,6 +80,8 @@ class OfficialParticipant(Participant):
             "cot-extract": CoTExtractAgent(),
             "self-correct": SelfCorrectAgent(),
             "few-shot": FewShotAgent(),
+            "cot-few-shot": CoTFewShotAgent(),
+            "ensemble": EnsembleAgent(),
         }
 
     def get_info(self) -> ParticipantInfo:
@@ -103,6 +108,14 @@ class OfficialParticipant(Participant):
                 PipelineInfo(
                     name="few-shot",
                     description="RAG pipeline with schema-similar examples as demonstrations.",
+                ),
+                PipelineInfo(
+                    name="cot-few-shot",
+                    description="Hybrid: few-shot examples guide CoT reasoning then extraction.",
+                ),
+                PipelineInfo(
+                    name="ensemble",
+                    description="Dual extraction (strict+creative) with smart field-level merge.",
                 ),
             ],
         )
