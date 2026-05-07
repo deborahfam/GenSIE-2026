@@ -4,10 +4,7 @@ from typing import Any, Dict
 from openai import OpenAI
 from gensie.agent import GenSIEAgent, Participant, ParticipantInfo, PipelineInfo
 from gensie.task import Task
-from gensie.pipelines import (
-    EnhancedPromptAgent, CoTExtractAgent, SelfCorrectAgent,
-    FewShotAgent, CoTFewShotAgent, EnsembleAgent,
-)
+from gensie.sieve import SieveFastAgent, SieveVerifiedAgent, SieveFewShotAgent
 from dotenv import load_dotenv
 from logging import getLogger
 
@@ -69,19 +66,14 @@ class BasicAgent(GenSIEAgent):
 
 class OfficialParticipant(Participant):
     """
-    Standard entry point for the competition.
-    Participants can configure up to 3 pipelines here.
+    Contest entry point exposing exactly 3 SIEVE v2 pipelines.
     """
 
     def __init__(self):
         self.pipelines = {
-            "baseline": BasicAgent(),
-            "enhanced-prompt": EnhancedPromptAgent(),
-            "cot-extract": CoTExtractAgent(),
-            "self-correct": SelfCorrectAgent(),
-            "few-shot": FewShotAgent(),
-            "cot-few-shot": CoTFewShotAgent(),
-            "ensemble": EnsembleAgent(),
+            "sieve-fast": SieveFastAgent(),
+            "sieve-verified": SieveVerifiedAgent(),
+            "sieve-fewshot": SieveFewShotAgent(),
         }
 
     def get_info(self) -> ParticipantInfo:
@@ -90,38 +82,21 @@ class OfficialParticipant(Participant):
             institution="Official",
             pipelines=[
                 PipelineInfo(
-                    name="baseline",
-                    description="Standard OpenAI agent using structured outputs.",
+                    name="sieve-fast",
+                    description="Single extraction with schema-aware compact prompt, deterministic repair, and grounding guard.",
                 ),
                 PipelineInfo(
-                    name="enhanced-prompt",
-                    description="Schema-aware prompt engineering with null-trap detection.",
+                    name="sieve-verified",
+                    description="sieve-fast plus adaptive verifier call for high-risk nullable fields.",
                 ),
                 PipelineInfo(
-                    name="cot-extract",
-                    description="Two-step Chain-of-Thought reasoning then constrained extraction.",
-                ),
-                PipelineInfo(
-                    name="self-correct",
-                    description="Extract-validate-correct loop with null-trap verification.",
-                ),
-                PipelineInfo(
-                    name="few-shot",
-                    description="RAG pipeline with schema-similar examples as demonstrations.",
-                ),
-                PipelineInfo(
-                    name="cot-few-shot",
-                    description="Hybrid: few-shot examples guide CoT reasoning then extraction.",
-                ),
-                PipelineInfo(
-                    name="ensemble",
-                    description="Dual extraction (strict+creative) with smart field-level merge.",
+                    name="sieve-fewshot",
+                    description="sieve-fast plus one schema-similar example for few-shot guidance.",
                 ),
             ],
         )
 
     def get_agent(self, pipeline_name: str) -> GenSIEAgent:
         if pipeline_name not in self.pipelines:
-            # Fallback to default if pipeline not found, or raise error
-            return self.pipelines["baseline"]
+            return self.pipelines["sieve-fast"]
         return self.pipelines[pipeline_name]
